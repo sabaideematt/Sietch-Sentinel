@@ -13,7 +13,7 @@ Sietch Sentinel monitors orbital behavior across satellite constellations, detec
 | **1. Ingestion** | TLE fetch, SGP4 propagation, delta-V estimation | Space-Track.org, CelesTrak, sgp4 |
 | **2. Triage ML** | Anomaly detection & severity routing | Isolation Forest, LSTM Autoencoder |
 | **3. Orchestrator Agent** | Claude ReAct investigation loop (11 tools) | Anthropic SDK, LangChain |
-| **4. Memory Layer** | Persistent per-satellite knowledge base | SQLite, ChromaDB, Redis |
+| **4. Memory Layer** | Persistent per-satellite knowledge base (write-through) | SQLite → Redis → ChromaDB |
 | **5. Reports & SOC** | Multi-format output & SIEM integration | STIX 2.1, Splunk HEC, Elastic ECS |
 | **6. Feedback Loop** | Analyst review → retraining pipeline | Verdict processing, threshold tuning |
 

@@ -17,6 +17,7 @@ from src.schemas import (
     InvestigationRequest,
     InvestigationResult,
     OrbitRegime,
+    ResourceUsage,
     SatelliteProfile,
     SpaceWeatherContext,
     StateVector,
@@ -54,11 +55,17 @@ class TestDeltaVEstimate:
     def test_confidence_interval_order(self, sample_delta_v):
         assert sample_delta_v.confidence_interval[0] <= sample_delta_v.confidence_interval[1]
 
+    def test_uncertainty_range_auto_populated(self, sample_delta_v):
+        assert sample_delta_v.delta_v_uncertainty_range is not None
+        assert sample_delta_v.delta_v_uncertainty_range == sample_delta_v.confidence_interval
+
     def test_serialization(self, sample_delta_v):
         data = json.loads(sample_delta_v.model_dump_json())
         assert "delta_v_m_s" in data
         assert "uncertainty_m_s" in data
         assert "confidence_interval" in data
+        assert "delta_v_uncertainty_range" in data
+        assert data["delta_v_uncertainty_range"] == list(data["confidence_interval"])
 
 
 class TestInvestigationResult:
@@ -85,6 +92,28 @@ class TestInvestigationResult:
         for ttp in sample_investigation_result.ttp_matches:
             assert ttp.confidence in (ConfidenceTier.HIGH, ConfidenceTier.MED, ConfidenceTier.LOW)
             assert ttp.framework in ("SPARTA", "ATT&CK")
+            assert isinstance(ttp.indicator_score, float)
+
+    def test_investigation_budget_used_block(self):
+        budget = ResourceUsage(
+            tool_calls_used=8, tool_calls_max=15,
+            tokens_used=4500, tokens_max=8000,
+            wall_clock_seconds=42.3, wall_clock_max=90.0,
+            budget_exhausted=False,
+        )
+        result = InvestigationResult(
+            investigation_id="budget-test",
+            norad_cat_id=25544,
+            satellite_name="ISS",
+            orbit_regime=OrbitRegime.LEO,
+            anomaly_score=0.5,
+            investigation_budget_used=budget,
+        )
+        data = json.loads(result.model_dump_json())
+        assert "investigation_budget_used" in data
+        assert data["investigation_budget_used"]["tool_calls_used"] == 8
+        assert data["investigation_budget_used"]["tokens_max"] == 8000
+        assert data["investigation_budget_used"]["budget_exhausted"] is False
 
 
 class TestSpaceWeatherContext:

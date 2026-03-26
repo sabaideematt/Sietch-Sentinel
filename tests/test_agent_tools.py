@@ -26,6 +26,7 @@ class TestTTPMatcher:
         })
         assert "SPARTA" in result
         assert "EX-0001" in result
+        assert "Indicator score:" in result
 
     def test_high_confidence_requires_natural_cause_ruled_out(self):
         from src.agent.tools.ttp_matcher import ttp_matcher_tool

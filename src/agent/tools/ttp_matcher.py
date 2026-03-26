@@ -69,6 +69,7 @@ def ttp_matcher_tool(
                 technique_id=tech_id,
                 technique_name=info["name"],
                 confidence=confidence,
+                indicator_score=round(ratio, 2),
                 evidence_summary=f"Matched indicators: {', '.join(overlap)}",
                 natural_cause_ruled_out=natural_causes_ruled_out,
             ))
@@ -83,7 +84,8 @@ def ttp_matcher_tool(
     for m in sorted(matches, key=lambda x: x.confidence.value):
         lines.append(
             f"  [{m.framework}] {m.technique_id} — {m.technique_name}\n"
-            f"    Confidence: {m.confidence.value} | {m.evidence_summary}\n"
+            f"    Confidence: {m.confidence.value} | Indicator score: {m.indicator_score}\n"
+            f"    {m.evidence_summary}\n"
             f"    Natural causes ruled out: {m.natural_cause_ruled_out}"
         )
     return "\n".join(lines)

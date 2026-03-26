@@ -67,6 +67,12 @@ class DeltaVEstimate(BaseModel):
     delta_v_m_s: float
     uncertainty_m_s: float
     confidence_interval: tuple[float, float]
+    delta_v_uncertainty_range: Optional[tuple[float, float]] = None
+
+    def model_post_init(self, __context):
+        """Auto-populate uncertainty_range from confidence_interval if not set."""
+        if self.delta_v_uncertainty_range is None:
+            self.delta_v_uncertainty_range = self.confidence_interval
 
 
 # ── Layer 1.5: Space Weather Context ──
@@ -111,6 +117,7 @@ class TTPMatch(BaseModel):
     technique_id: str
     technique_name: str
     confidence: ConfidenceTier
+    indicator_score: float = 0.0
     evidence_summary: str
     natural_cause_ruled_out: bool = False
 
@@ -141,7 +148,7 @@ class InvestigationResult(BaseModel):
     tool_calls_used: int = 0
     tokens_used: int = 0
     wall_clock_seconds: float = 0.0
-    resource_usage: Optional[ResourceUsage] = None
+    investigation_budget_used: Optional[ResourceUsage] = None
     insufficient_data: bool = False
     executive_summary: str = ""
     recommended_actions: list[str] = []

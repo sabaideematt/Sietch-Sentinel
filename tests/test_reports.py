@@ -51,6 +51,8 @@ class TestReportGenerator:
         assert "uncertainty_m_s" in dv
         assert "confidence_interval" in dv
         assert len(dv["confidence_interval"]) == 2
+        assert "delta_v_uncertainty_range" in dv
+        assert dv["delta_v_uncertainty_range"] == dv["confidence_interval"]
 
     def test_json_ttp_match_has_confidence_tiers(self, sample_investigation_result):
         from src.reports.generator import ReportGenerator
@@ -63,6 +65,8 @@ class TestReportGenerator:
         assert "technique_id" in ttp
         assert "confidence" in ttp
         assert ttp["confidence"] in ["HIGH", "MED", "LOW"]
+        assert "indicator_score" in ttp
+        assert isinstance(ttp["indicator_score"], float)
         assert "evidence_summary" in ttp
         assert "natural_cause_ruled_out" in ttp
 

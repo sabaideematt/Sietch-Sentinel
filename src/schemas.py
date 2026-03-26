@@ -69,6 +69,18 @@ class DeltaVEstimate(BaseModel):
     confidence_interval: tuple[float, float]
 
 
+# ── Layer 1.5: Space Weather Context ──
+
+class SpaceWeatherContext(BaseModel):
+    """Space weather conditions at time of anomaly — used to rule out natural causes."""
+    kp_index: float = 0.0
+    solar_flux_sfu: float = 0.0
+    cme_events_nearby: int = 0
+    geomagnetic_storm: bool = False
+    data_timestamp: datetime = Field(default_factory=datetime.utcnow)
+    source: str = "NOAA_SWPC"
+
+
 # ── Layer 2: Triage ──
 
 class AnomalyScore(BaseModel):
@@ -103,6 +115,17 @@ class TTPMatch(BaseModel):
     natural_cause_ruled_out: bool = False
 
 
+class ResourceUsage(BaseModel):
+    """Resource budget consumption metrics for an investigation."""
+    tool_calls_used: int = 0
+    tool_calls_max: int = 15
+    tokens_used: int = 0
+    tokens_max: int = 8000
+    wall_clock_seconds: float = 0.0
+    wall_clock_max: float = 90.0
+    budget_exhausted: bool = False
+
+
 class InvestigationResult(BaseModel):
     """Final output of a single investigation."""
     investigation_id: str
@@ -111,12 +134,14 @@ class InvestigationResult(BaseModel):
     orbit_regime: OrbitRegime
     anomaly_score: float
     delta_v: Optional[DeltaVEstimate] = None
+    space_weather: Optional[SpaceWeatherContext] = None
     ttp_matches: list[TTPMatch] = []
     evidence_chain: list[str] = []
     data_gaps: list[str] = []
     tool_calls_used: int = 0
     tokens_used: int = 0
     wall_clock_seconds: float = 0.0
+    resource_usage: Optional[ResourceUsage] = None
     insufficient_data: bool = False
     executive_summary: str = ""
     recommended_actions: list[str] = []

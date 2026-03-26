@@ -1,294 +1,202 @@
-"""Unified Memory Store — wraps Redis (cache), SQLite (structured), ChromaDB (vector)."""
+"""Unified Memory Store — facade over SQLite, ChromaDB, and Redis with write-through consistency."""
 
 from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from src.config import settings
-from src.schemas import AnalystFeedback, SatelliteProfile, OrbitRegime
+from src.memory.sqlite_backend import SQLiteBackend
+from src.memory.redis_backend import RedisBackend
+from src.memory.chroma_backend import ChromaBackend
+from src.schemas import AnalystFeedback, SatelliteProfile
 
 logger = logging.getLogger(__name__)
 
 
 class MemoryStore:
     """
-    Unified interface to the three memory backends.
+    Unified facade over three memory backends with write-through consistency.
 
-    - SQLite: satellite profiles, maneuver history, feedback
-    - ChromaDB: vector store for semantic search over investigations
-    - Redis: live state cache (optional, degrades gracefully)
+    Write path (on investigation close):
+      1. Write to SQLite (source of truth)
+      2. Invalidate/update Redis cache
+      3. Index into ChromaDB
+      4. If step 2 or 3 fails → log to sync_log with "pending" status for retry
+
+    Read path:
+      1. Check Redis cache first (with freshness tag check)
+      2. Fall back to SQLite if cache miss or stale
+      3. Semantic queries go directly to ChromaDB
     """
 
     def __init__(self, db_path: Optional[Path] = None):
-        self.db_path = db_path or settings.data_dir / "sietch_sentinel.db"
-        self._init_sqlite()
-        self._chroma_collection = None
-        self._redis_client = None
+        self.sqlite = SQLiteBackend(db_path)
+        self.redis = RedisBackend()
+        self.chroma = ChromaBackend()
 
-    # ──────────────────── SQLite ────────────────────
-
-    def _init_sqlite(self):
-        """Create tables if they don't exist."""
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self.db_path))
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS satellite_profiles (
-                norad_cat_id INTEGER PRIMARY KEY,
-                object_name TEXT NOT NULL,
-                orbit_regime TEXT DEFAULT 'UNKNOWN',
-                operator TEXT DEFAULT '',
-                launch_date TEXT,
-                typical_delta_v_m_s REAL DEFAULT 0.0,
-                maneuver_frequency_days REAL DEFAULT 0.0,
-                anomaly_threshold_low REAL DEFAULT 0.0,
-                anomaly_threshold_high REAL DEFAULT 1.0,
-                total_investigations INTEGER DEFAULT 0,
-                false_positive_count INTEGER DEFAULT 0,
-                last_updated TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS investigations (
-                id TEXT PRIMARY KEY,
-                norad_cat_id INTEGER,
-                anomaly_score REAL,
-                executive_summary TEXT,
-                evidence_chain TEXT,
-                ttp_matches TEXT,
-                created_at TEXT,
-                FOREIGN KEY (norad_cat_id) REFERENCES satellite_profiles(norad_cat_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS analyst_feedback (
-                feedback_id TEXT PRIMARY KEY,
-                investigation_id TEXT,
-                norad_cat_id INTEGER,
-                analyst_id TEXT DEFAULT '',
-                verdict TEXT NOT NULL,
-                notes TEXT DEFAULT '',
-                confidence_override TEXT,
-                created_at TEXT,
-                FOREIGN KEY (investigation_id) REFERENCES investigations(id)
-            );
-        """)
-        conn.close()
-        logger.info("SQLite initialized at %s", self.db_path)
+    # ──────────────────── Read Operations ────────────────────
 
     def get_satellite_profile(self, norad_cat_id: int) -> Optional[SatelliteProfile]:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM satellite_profiles WHERE norad_cat_id = ?",
-            (norad_cat_id,),
-        ).fetchone()
-        conn.close()
-        if row is None:
-            return None
-        return SatelliteProfile(
-            norad_cat_id=row["norad_cat_id"],
-            object_name=row["object_name"],
-            orbit_regime=OrbitRegime(row["orbit_regime"]),
-            operator=row["operator"],
-            typical_delta_v_m_s=row["typical_delta_v_m_s"],
-            maneuver_frequency_days=row["maneuver_frequency_days"],
-            anomaly_threshold_low=row["anomaly_threshold_low"],
-            anomaly_threshold_high=row["anomaly_threshold_high"],
-            total_investigations=row["total_investigations"],
-            false_positive_count=row["false_positive_count"],
-        )
+        """Read-through: Redis cache → SQLite fallback."""
+        # Try cache first
+        cached = self.redis.get_cached_profile(norad_cat_id)
+        if cached is not None:
+            try:
+                return SatelliteProfile.model_validate_json(cached)
+            except Exception:
+                pass  # Corrupted cache, fall through to SQLite
 
-    def upsert_satellite_profile(self, norad_cat_id: int, data: dict) -> None:
-        conn = sqlite3.connect(str(self.db_path))
-        now = datetime.utcnow().isoformat()
-        conn.execute(
-            """INSERT INTO satellite_profiles
-                (norad_cat_id, object_name, orbit_regime, operator,
-                 typical_delta_v_m_s, maneuver_frequency_days,
-                 anomaly_threshold_low, anomaly_threshold_high, last_updated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(norad_cat_id) DO UPDATE SET
-                 object_name = COALESCE(excluded.object_name, object_name),
-                 orbit_regime = COALESCE(excluded.orbit_regime, orbit_regime),
-                 operator = COALESCE(excluded.operator, operator),
-                 typical_delta_v_m_s = COALESCE(excluded.typical_delta_v_m_s, typical_delta_v_m_s),
-                 maneuver_frequency_days = COALESCE(excluded.maneuver_frequency_days, maneuver_frequency_days),
-                 anomaly_threshold_low = COALESCE(excluded.anomaly_threshold_low, anomaly_threshold_low),
-                 anomaly_threshold_high = COALESCE(excluded.anomaly_threshold_high, anomaly_threshold_high),
-                 last_updated = ?
-            """,
-            (
-                norad_cat_id,
-                data.get("object_name", f"NORAD-{norad_cat_id}"),
-                data.get("orbit_regime", "UNKNOWN"),
-                data.get("operator", ""),
-                data.get("typical_delta_v_m_s", 0.0),
-                data.get("maneuver_frequency_days", 0.0),
-                data.get("anomaly_threshold_low", 0.0),
-                data.get("anomaly_threshold_high", 1.0),
-                now,
-            ),
-        )
-        conn.commit()
-        conn.close()
+        # SQLite is source of truth
+        profile = self.sqlite.get_satellite_profile(norad_cat_id)
 
-    def log_investigation(self, norad_cat_id: int, data: dict) -> None:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.execute(
-            """INSERT OR REPLACE INTO investigations
-               (id, norad_cat_id, anomaly_score, executive_summary, evidence_chain, ttp_matches, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                data.get("investigation_id", ""),
-                norad_cat_id,
-                data.get("anomaly_score", 0.0),
-                data.get("executive_summary", ""),
-                json.dumps(data.get("evidence_chain", [])),
-                json.dumps(data.get("ttp_matches", [])),
-                datetime.utcnow().isoformat(),
-            ),
-        )
-        conn.commit()
-        conn.close()
+        # Warm cache on read
+        if profile is not None:
+            self.redis.cache_profile(norad_cat_id, profile.model_dump_json())
 
-    def update_thresholds(self, norad_cat_id: int, data: dict) -> None:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.execute(
-            """UPDATE satellite_profiles
-               SET anomaly_threshold_low = ?, anomaly_threshold_high = ?, last_updated = ?
-               WHERE norad_cat_id = ?""",
-            (
-                data.get("low", 0.0),
-                data.get("high", 1.0),
-                datetime.utcnow().isoformat(),
-                norad_cat_id,
-            ),
-        )
-        conn.commit()
-        conn.close()
+        return profile
+
+    def search_investigations(self, query: str, top_k: int = 5) -> list[tuple[str, float]]:
+        """Semantic search over past investigations via ChromaDB."""
+        results = self.chroma.search(query, top_k=top_k)
+        return [(doc, dist) for doc, dist, _ in results]
 
     def get_analyst_feedback(
         self, norad_cat_id: int, investigation_id: str = ""
     ) -> list[AnalystFeedback]:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
+        return self.sqlite.get_analyst_feedback(norad_cat_id, investigation_id)
+
+    # ──────────────────── Write Operations (write-through) ────────────────────
+
+    def upsert_satellite_profile(self, norad_cat_id: int, data: dict) -> None:
+        """Write-through: SQLite → Redis cache → sync log on failure."""
+        # 1. SQLite (source of truth)
+        self.sqlite.upsert_satellite_profile(norad_cat_id, data)
+
+        # 2. Invalidate Redis cache
+        try:
+            profile = self.sqlite.get_satellite_profile(norad_cat_id)
+            if profile:
+                self.redis.cache_profile(norad_cat_id, profile.model_dump_json())
+        except Exception as e:
+            logger.warning("Redis cache update failed for profile %d: %s", norad_cat_id, e)
+            self.sqlite.log_pending_sync("profile", str(norad_cat_id))
+
+    def log_investigation(self, norad_cat_id: int, data: dict) -> None:
+        """Write-through: SQLite → ChromaDB vector index → Redis cleanup."""
+        investigation_id = data.get("investigation_id", "")
+
+        # 1. SQLite
+        self.sqlite.log_investigation(norad_cat_id, data)
+
+        # 2. ChromaDB — index the executive summary for semantic search
+        summary = data.get("executive_summary", "")
+        if summary and investigation_id:
+            try:
+                self.chroma.index(
+                    doc_id=investigation_id,
+                    text=summary,
+                    metadata={
+                        "norad_cat_id": norad_cat_id,
+                        "anomaly_score": data.get("anomaly_score", 0.0),
+                        "created_at": datetime.utcnow().isoformat(),
+                    },
+                )
+            except Exception as e:
+                logger.warning("ChromaDB index failed for investigation %s: %s", investigation_id, e)
+                self.sqlite.log_pending_sync("investigation_vector", investigation_id)
+
+        # 3. Clear live investigation state from Redis
         if investigation_id:
-            rows = conn.execute(
-                "SELECT * FROM analyst_feedback WHERE investigation_id = ? ORDER BY created_at DESC",
-                (investigation_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM analyst_feedback WHERE norad_cat_id = ? ORDER BY created_at DESC LIMIT 20",
-                (norad_cat_id,),
-            ).fetchall()
-        conn.close()
-        return [
-            AnalystFeedback(
-                feedback_id=r["feedback_id"],
-                investigation_id=r["investigation_id"],
-                analyst_id=r["analyst_id"],
-                verdict=r["verdict"],
-                notes=r["notes"],
-                confidence_override=r["confidence_override"],
-                created_at=datetime.fromisoformat(r["created_at"]) if r["created_at"] else datetime.utcnow(),
-            )
-            for r in rows
-        ]
+            self.redis.clear_investigation_state(investigation_id)
+
+    def update_thresholds(self, norad_cat_id: int, data: dict) -> None:
+        """Write-through: SQLite → Redis invalidation."""
+        self.sqlite.update_thresholds(norad_cat_id, data)
+
+        # Invalidate cached profile so next read picks up new thresholds
+        try:
+            profile = self.sqlite.get_satellite_profile(norad_cat_id)
+            if profile:
+                self.redis.cache_profile(norad_cat_id, profile.model_dump_json())
+        except Exception as e:
+            logger.warning("Redis cache invalidation failed for %d: %s", norad_cat_id, e)
+            self.sqlite.log_pending_sync("threshold", str(norad_cat_id))
 
     def save_analyst_feedback(self, feedback: AnalystFeedback) -> None:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.execute(
-            """INSERT OR REPLACE INTO analyst_feedback
-               (feedback_id, investigation_id, norad_cat_id, analyst_id, verdict, notes, confidence_override, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                feedback.feedback_id,
-                feedback.investigation_id,
-                0,  # TODO: extract from investigation
-                feedback.analyst_id,
-                feedback.verdict.value,
-                feedback.notes,
-                feedback.confidence_override.value if feedback.confidence_override else None,
-                feedback.created_at.isoformat(),
-            ),
-        )
-        conn.commit()
-        conn.close()
-
-    # ──────────────────── ChromaDB (Vector) ────────────────────
-
-    def _get_chroma(self):
-        """Lazy-init ChromaDB collection."""
-        if self._chroma_collection is not None:
-            return self._chroma_collection
-        try:
-            import chromadb
-
-            client = chromadb.PersistentClient(path=settings.chroma_persist_dir)
-            self._chroma_collection = client.get_or_create_collection(
-                name="investigations",
-                metadata={"hnsw:space": "cosine"},
-            )
-            logger.info("ChromaDB collection initialized.")
-        except ImportError:
-            logger.warning("chromadb not installed — vector search disabled.")
-        except Exception as e:
-            logger.warning("ChromaDB init failed: %s", e)
-        return self._chroma_collection
+        """Write feedback to SQLite."""
+        self.sqlite.save_analyst_feedback(feedback)
 
     def index_investigation(self, investigation_id: str, text: str, metadata: dict = None) -> None:
-        coll = self._get_chroma()
-        if coll is None:
-            return
-        coll.upsert(
-            ids=[investigation_id],
-            documents=[text],
-            metadatas=[metadata or {}],
-        )
+        """Direct ChromaDB index (for backward compat)."""
+        self.chroma.index(investigation_id, text, metadata)
 
-    def search_investigations(self, query: str, top_k: int = 5) -> list[tuple[str, float]]:
-        coll = self._get_chroma()
-        if coll is None:
-            return []
-        results = coll.query(query_texts=[query], n_results=top_k)
-        docs = results.get("documents", [[]])[0]
-        distances = results.get("distances", [[]])[0]
-        return list(zip(docs, distances))
+    # ──────────────────── Sync / Reconciliation ────────────────────
 
-    # ──────────────────── Redis (Cache) ────────────────────
+    def reconcile_pending_syncs(self) -> dict:
+        """
+        Process all pending sync entries. Called by nightly Airflow DAG.
+        Returns summary of results.
+        """
+        pending = self.sqlite.get_pending_syncs()
+        results = {"processed": 0, "succeeded": 0, "failed": 0}
 
-    def _get_redis(self):
-        """Lazy-init Redis client. Degrades gracefully if unavailable."""
-        if self._redis_client is not None:
-            return self._redis_client
-        try:
-            import redis as redis_lib
+        for entry in pending:
+            results["processed"] += 1
+            try:
+                self._retry_sync(entry)
+                self.sqlite.mark_synced(entry["id"])
+                results["succeeded"] += 1
+            except Exception as e:
+                logger.error("Sync retry failed for %s/%s: %s", entry["entity_type"], entry["entity_id"], e)
+                self.sqlite.mark_sync_failed(entry["id"])
+                results["failed"] += 1
 
-            self._redis_client = redis_lib.from_url(settings.redis_url, decode_responses=True)
-            self._redis_client.ping()
-            logger.info("Redis connection established.")
-        except Exception as e:
-            logger.warning("Redis unavailable — cache disabled: %s", e)
-            self._redis_client = None
-        return self._redis_client
+        logger.info("Reconciliation complete: %s", results)
+        return results
+
+    def _retry_sync(self, entry: dict) -> None:
+        """Retry a single pending sync operation."""
+        entity_type = entry["entity_type"]
+        entity_id = entry["entity_id"]
+
+        if entity_type == "profile" or entity_type == "threshold":
+            norad_cat_id = int(entity_id)
+            profile = self.sqlite.get_satellite_profile(norad_cat_id)
+            if profile:
+                success = self.redis.cache_profile(norad_cat_id, profile.model_dump_json())
+                if not success:
+                    raise RuntimeError(f"Redis cache update failed for {entity_id}")
+
+        elif entity_type == "investigation_vector":
+            # Re-index from SQLite data
+            with self.sqlite._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM investigations WHERE id = ?", (entity_id,)
+                ).fetchone()
+            if row and row["executive_summary"]:
+                success = self.chroma.index(
+                    doc_id=entity_id,
+                    text=row["executive_summary"],
+                    metadata={
+                        "norad_cat_id": row["norad_cat_id"],
+                        "anomaly_score": row["anomaly_score"],
+                    },
+                )
+                if not success:
+                    raise RuntimeError(f"ChromaDB index failed for {entity_id}")
+
+    # ──────────────────── Cache Helpers (pass-through) ────────────────────
 
     def cache_set(self, key: str, value: str, ttl_seconds: int = 3600) -> None:
-        r = self._get_redis()
-        if r:
-            try:
-                r.setex(key, ttl_seconds, value)
-            except Exception as e:
-                logger.warning("Redis SET failed: %s", e)
+        self.redis.set(key, value, ttl_seconds)
 
     def cache_get(self, key: str) -> Optional[str]:
-        r = self._get_redis()
-        if r:
-            try:
-                return r.get(key)
-            except Exception as e:
-                logger.warning("Redis GET failed: %s", e)
-        return None
+        return self.redis.get(key)
+
+    def _get_redis(self):
+        """Expose redis client for config checks (backward compat)."""
+        return self.redis._get_client()

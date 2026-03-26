@@ -48,16 +48,31 @@ Sietch-Sentinel/
 │   │       ├── fleet_correlator.py
 │   │       ├── memory_rw.py
 │   │       └── analyst_feedback.py
-│   ├── memory/              # Layer 4: SQLite + ChromaDB + Redis
-│   │   └── store.py
+│   ├── memory/              # Layer 4: Split backends + write-through
+│   │   ├── store.py         # Unified facade with write-through consistency
+│   │   ├── sqlite_backend.py
+│   │   ├── redis_backend.py # Freshness-tagged caching
+│   │   └── chroma_backend.py
 │   ├── reports/             # Layer 5: Reports & SOC export
 │   │   ├── generator.py
 │   │   ├── stix_builder.py
 │   │   └── soc_export.py
 │   └── feedback/            # Layer 6: Analyst feedback loop
 │       └── handler.py
+├── dags/                    # Airflow DAGs
+│   └── memory_reconciliation.py  # Nightly SQLite↔Redis↔ChromaDB sync
+├── tests/                   # Test suite (pytest)
+│   ├── conftest.py          # Shared fixtures
+│   ├── test_ingestion.py
+│   ├── test_triage.py
+│   ├── test_memory.py
+│   ├── test_reports.py
+│   ├── test_schemas.py
+│   ├── test_feedback.py
+│   └── test_agent_tools.py
 ├── .env.example             # Environment variable template
 ├── requirements.txt
+├── pyproject.toml           # Pytest & coverage config
 ├── Dockerfile
 ├── docker-compose.yml
 └── README.md
@@ -103,11 +118,32 @@ python -m src.cli ingest 36411 --days 30
 python -m src.cli investigate 36411 --severity mid
 ```
 
-### 6. Docker
+### 6. Run Tests
+
+```bash
+pytest
+pytest --cov=src          # with coverage
+```
+
+### 7. Docker
 
 ```bash
 docker-compose up --build
 ```
+
+## Memory Layer — Write-Through Consistency
+
+The Memory Layer uses three backends with write-through consistency:
+
+| Backend | Role | Staleness Handling |
+|---|---|---|
+| **SQLite** | Source of truth (profiles, investigations, feedback) | Always authoritative |
+| **Redis** | Live cache with freshness tags | Timestamped envelopes; stale check via `is_stale()` |
+| **ChromaDB** | Vector store for semantic search | Re-indexed on write; nightly reconciliation |
+
+**Write path:** SQLite → Redis invalidation → ChromaDB index → sync_log on failure.
+**Read path:** Redis cache (if fresh) → SQLite fallback → cache warm on miss.
+**Nightly reconciliation:** Airflow DAG (`dags/memory_reconciliation.py`) processes pending syncs, re-indexes stale vectors, and warms the Redis cache.
 
 ## External Data Sources
 

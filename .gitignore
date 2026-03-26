@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+.Python
+develop-eggs/
+.installed.cfg
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data & Models
+data/raw/
+data/processed/
+models/saved/
+*.h5
+*.pkl
+*.joblib
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+dump.rdb
+
+# ChromaDB
+chroma_data/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
